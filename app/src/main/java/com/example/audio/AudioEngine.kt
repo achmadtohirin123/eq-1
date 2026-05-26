@@ -113,67 +113,75 @@ class AudioEngine {
     private fun startProcessingLoop() {
         processingJob?.cancel()
         processingJob = scope.launch {
-            val minBufSize = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            val track = AudioTrack.Builder()
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                        .build()
+            try {
+                val minBufSize = AudioTrack.getMinBufferSize(
+                    sampleRate,
+                    AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT
                 )
-                .setBufferSizeInBytes(minBufSize.coerceAtLeast(bufferSize * 4))
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
 
-            track.play()
+                val track = AudioTrack.Builder()
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRate)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBufSize.coerceAtLeast(bufferSize * 4))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
 
-            // Microphone Setup if Mic is chosen
-            var micRecord: AudioRecord? = null
-            if (activeSource == InputSource.MICROPHONE) {
-                try {
-                    val recordBufSize = AudioRecord.getMinBufferSize(
-                        sampleRate,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT
-                    )
-                    micRecord = AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
-                        sampleRate,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
-                        recordBufSize.coerceAtLeast(bufferSize * 2)
-                    )
-                    if (micRecord.state == AudioRecord.STATE_INITIALIZED) {
-                        micRecord.startRecording()
-                    } else {
-                        Log.e("AudioEngine", "AudioRecord initialized state is failed")
-                    }
-                } catch (e: Exception) {
-                    Log.e("AudioEngine", "Failed to start microphone recording: ${e.message}")
+                if (track.state != AudioTrack.STATE_INITIALIZED) {
+                    Log.e("AudioEngine", "AudioTrack was not initialized properly!")
+                    isPlaying = false
+                    return@launch
                 }
-            }
 
-            val audioBuffer = ShortArray(bufferSize * 2) // Stereo output (L, R, L, R)
-            val micBuffer = ShortArray(bufferSize)
+                track.play()
 
-            // Synth generators wave state
-            var synthPhaseIndex = 0L
-            var melodyPhaseIndex = 0L
+                // Microphone Setup if Mic is chosen
+                var micRecord: AudioRecord? = null
+                if (activeSource == InputSource.MICROPHONE) {
+                    try {
+                        val recordBufSize = AudioRecord.getMinBufferSize(
+                            sampleRate,
+                            AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT
+                        )
+                        micRecord = AudioRecord(
+                            MediaRecorder.AudioSource.MIC,
+                            sampleRate,
+                            AudioFormat.CHANNEL_IN_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT,
+                            recordBufSize.coerceAtLeast(bufferSize * 2)
+                        )
+                        if (micRecord.state == AudioRecord.STATE_INITIALIZED) {
+                            micRecord.startRecording()
+                        } else {
+                            Log.e("AudioEngine", "AudioRecord initialized state is failed")
+                        }
+                    } catch (e: Exception) {
+                        Log.e("AudioEngine", "Failed to start microphone recording: ${e.message}")
+                    }
+                }
 
-            // Progress tracking
-            var progressCounter = 0L
+                val audioBuffer = ShortArray(bufferSize * 2) // Stereo output (L, R, L, R)
+                val micBuffer = ShortArray(bufferSize)
 
-            // Noise gate rolling threshold RMS
-            var delayCircularBuffer = ShortArray(sampleRate * 2) // 2 sec stereo delay memory
-            var delayWriteIndex = 0
+                // Synth generators wave state
+                var synthPhaseIndex = 0L
+                var melodyPhaseIndex = 0L
 
-            while (isActive && isPlaying) {
+                // Progress tracking
+                var progressCounter = 0L
+
+                // Noise gate rolling threshold RMS
+                val maxDelaySamples = (sampleRate * 1.5).toInt()
+                val delayCircularBuffer = ShortArray(maxDelaySamples * 2) // fits max delay perfectly
+                var delayWriteIndex = 0
+
+                while (isActive && isPlaying) {
                 when (activeSource) {
                     InputSource.DEMO -> {
                         // Generate a futuristic synthesized dance loop mathematically:
@@ -361,30 +369,29 @@ class AudioEngine {
                         var finalRight = right
 
                         if (activePreset.isDelayOn) {
-                            val maxDelaySamples = (sampleRate * 1.5).toInt()
                             val delaySamplesCount = ((activePreset.delayTimeMs / 1000f) * sampleRate).toInt().coerceIn(100, maxDelaySamples)
                             
-                            val readIndex = (delayWriteIndex - delaySamplesCount * 2 + maxDelaySamples * 2) % (maxDelaySamples * 2)
+                            val readIndex = (delayWriteIndex - delaySamplesCount * 2 + delayCircularBuffer.size) % delayCircularBuffer.size
 
                             val historicalLeft = delayCircularBuffer[readIndex].toFloat()
-                            val historicalRight = delayCircularBuffer[readIndex + 1].toFloat()
+                            val historicalRight = delayCircularBuffer[(readIndex + 1) % delayCircularBuffer.size].toFloat()
 
                             finalLeft = left + historicalLeft * activePreset.delayFeedback
                             finalRight = right + historicalRight * activePreset.delayFeedback
 
                             // Update delay queue
                             delayCircularBuffer[delayWriteIndex] = finalLeft.toInt().coerceIn(-32768, 32767).toShort()
-                            delayCircularBuffer[delayWriteIndex + 1] = finalRight.toInt().coerceIn(-32768, 32767).toShort()
+                            delayCircularBuffer[(delayWriteIndex + 1) % delayCircularBuffer.size] = finalRight.toInt().coerceIn(-32768, 32767).toShort()
 
-                            delayWriteIndex = (delayWriteIndex + 2) % (maxDelaySamples * 2)
+                            delayWriteIndex = (delayWriteIndex + 2) % delayCircularBuffer.size
                         }
 
                         // 5. Reverb Professional Emulator (using phased recursive delays)
                         if (activePreset.isReverbOn) {
                             val sizeFactor = activePreset.reverbLevel * 0.7f
                             val reverbOffsetL = (Math.sin(i * 0.05) * 500 * sizeFactor).toInt()
-                            finalLeft += (finalLeft * 0.3f + delayCircularBuffer[Math.abs((delayWriteIndex - 800 + reverbOffsetL) % delayCircularBuffer.size)].toFloat() * sizeFactor)
-                            finalRight += (finalRight * 0.3f + delayCircularBuffer[Math.abs((delayWriteIndex - 1200 - reverbOffsetL) % delayCircularBuffer.size)].toFloat() * sizeFactor)
+                            finalLeft += (finalLeft * 0.3f + delayCircularBuffer[(Math.abs(delayWriteIndex - 800 + reverbOffsetL) % delayCircularBuffer.size)].toFloat() * sizeFactor)
+                            finalRight += (finalRight * 0.3f + delayCircularBuffer[(Math.abs(delayWriteIndex - 1200 - reverbOffsetL) % delayCircularBuffer.size)].toFloat() * sizeFactor)
                         }
 
                         // 6. Stereo Widener
@@ -469,13 +476,21 @@ class AudioEngine {
                 track.write(audioBuffer, 0, audioBuffer.size)
             }
 
-            try {
-                track.stop()
-                track.release()
-                micRecord?.stop()
-                micRecord?.release()
+                try {
+                    track.stop()
+                    track.release()
+                    micRecord?.stop()
+                    micRecord?.release()
+                } catch (e: Exception) {
+                    // Ignore tracking failures during rapid shutdown
+                }
             } catch (e: Exception) {
-                // Ignore tracking failures during rapid shutdown
+                Log.e("AudioEngine", "Exception during AudioEngine background processing loop", e)
+                try {
+                    isPlaying = false
+                    vuLeft.value = 0f
+                    vuRight.value = 0f
+                } catch (t: Throwable) {}
             }
         }
     }
